@@ -12,6 +12,8 @@
 
 package gg.airbrush.sdk.classes.pixels
 
+import com.zaxxer.hikari.HikariConfig
+import com.zaxxer.hikari.HikariDataSource
 import gg.ingot.iron.Iron
 import gg.ingot.iron.annotations.Model
 import gg.ingot.iron.ironSettings
@@ -20,21 +22,24 @@ import gg.ingot.iron.sql.params.sqlParams
 import gg.ingot.iron.strategies.NamingStrategy
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.launch
 import net.minestom.server.MinecraftServer
 import net.minestom.server.coordinate.Point
 import net.minestom.server.item.Material
+import org.intellij.lang.annotations.Language
+import org.slf4j.LoggerFactory
 import java.io.File
+import java.sql.ResultSet
 import java.time.Instant
 import java.util.*
 import kotlin.math.roundToInt
 import kotlin.system.measureTimeMillis
+import kotlin.time.measureTimedValue
 
-@Model
 data class PixelData(
-//    @Column(primaryKey = true)
     val id: Int? = null,
     val timestamp: Long,
     val worldId: String,
@@ -57,6 +62,19 @@ data class PixelData(
                 material INTEGER NOT NULL
             );
         """.trimIndent()
+
+        fun fromResult(rs: ResultSet): PixelData {
+            return PixelData(
+                id = rs.getInt("id"),
+                timestamp = rs.getLong("timestamp"),
+                worldId = rs.getString("world_id"),
+                playerUuid = rs.getString("player_uuid"),
+                x = rs.getInt("x"),
+                y = rs.getInt("y"),
+                z = rs.getInt("z"),
+                material = rs.getInt("material")
+            )
+        }
     }
 }
 
@@ -68,38 +86,97 @@ class Pixels {
 //        driver = DatabaseDriver.SQLITE
 //    }
 
-    private val iron = Iron("jdbc:sqlite:${data.absolutePath}/pixel_data.db", ironSettings {
-        namingStrategy = NamingStrategy.SNAKE_CASE
-        driver = DatabaseDriver.SQLITE
-        minimumActiveConnections = 2
-        maximumConnections = 8
-    })
+//    private val iron = Iron("jdbc:sqlite:${data.absolutePath}/pixel_data.db", ironSettings {
+//        namingStrategy = NamingStrategy.SNAKE_CASE
+//        driver = DatabaseDriver.SQLITE
+//        minimumActiveConnections = 2
+//        maximumConnections = 8
+//    })
+
+    private val hikariConf = HikariConfig().apply {
+        jdbcUrl = "jdbc:sqlite:${data.absolutePath}/pixel_data.db"
+        driverClassName = "org.sqlite.JDBC"
+        maximumPoolSize = 8
+    }
+    private val ds = HikariDataSource(hikariConf)
+
+    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
+    private val logger = LoggerFactory.getLogger(Pixels::class.java)
 
     init {
         if(!data.exists()) data.mkdir()
-        iron.connect()
+//        iron.connect()
 
-        CoroutineScope(Dispatchers.IO).launch {
-            iron.execute(PixelData.tableDefinition)
+        scope.launch {
+            ds.connection.use { conn ->
+                conn.createStatement().use { statement ->
+                    statement.execute(PixelData.tableDefinition)
+                }
+            }
         }
     }
 
     suspend fun paintMulti(positions: List<Point>, player: UUID, material: Material, world: String) {
-        iron.transaction {
-            for (position in positions) {
+        val connection = ds.connection
+
+        try {
+            connection.autoCommit = false
+            // id better be serial.
+            val statement = connection.prepareStatement(sql("""
+                INSERT INTO pixel_data (id, timestamp, world_id, player_uuid, x, y, z, material)
+                    VALUES(DEFAULT, ?, ?, ?, ?, ?, ?, ?)
+            """.trimIndent()))
+
+            for((index, pos) in positions.withIndex()) {
                 val data = PixelData(
                     worldId = world,
                     timestamp = System.currentTimeMillis(),
                     playerUuid = player.toString(),
-                    x = position.x().roundToInt(),
-                    y = position.y().roundToInt(),
-                    z = position.z().roundToInt(),
+                    x = pos.x().roundToInt(),
+                    y = pos.y().roundToInt(),
+                    z = pos.z().roundToInt(),
                     material = material.id()
                 )
-                prepare("""
-                    INSERT INTO pixel_data (id, timestamp, world_id, player_uuid, x, y, z, material)
-                     VALUES (NULL, ?, ?, ?, ?, ?, ?, ?)
-                """.trimIndent(), data.timestamp, data.worldId, data.playerUuid, data.x, data.y, data.z, data.material)
+
+                statement.setLong(1, data.timestamp)
+                statement.setString(2, data.worldId)
+                statement.setString(3, data.playerUuid)
+                statement.setInt(4, data.x)
+                statement.setInt(5, data.y)
+                statement.setInt(6, data.z)
+                statement.setInt(7, data.material)
+
+                statement.addBatch()
+
+                // periodically commit the batch.
+                if(index % 50 == 0) {
+                    val (commands, time) = measureTimedValue {
+                        val amount = statement.executeBatch()
+                        connection.commit()
+
+                        amount
+                    }
+                    logger.trace("Committed {} commands in {}ms.", commands.size, time.inWholeMilliseconds)
+                }
+            }
+
+            // push remaining commands.
+            val (commands, time) = measureTimedValue {
+                val amount = statement.executeBatch()
+                connection.commit()
+
+                amount
+            }
+            logger.trace("Committed {} commands in {}ms.", commands.size, time.inWholeMilliseconds)
+        } finally {
+            if(connection != null) {
+                if(!connection.autoCommit) {
+                    connection.autoCommit = true
+                }
+
+                // manually close.
+                connection.close()
             }
         }
     }
@@ -166,5 +243,6 @@ class Pixels {
             .map { Material.fromId(it.material)!! to it.count }
             .toList()
     }
-
 }
+
+private fun sql(@Language("SQL") sql: String) = sql
